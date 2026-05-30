@@ -3,8 +3,10 @@ import {
   getBaseDirFromSkillReadPathForTests,
   getCondensedSkillViewForTests,
   listSkillLinkedFilesForTests,
+  maybeAddFailureRecoveryGuidanceForTests,
   maybeAddSkillDiscoveryGuidanceForTests,
   recordSkillUsageForTests,
+  resetFailureRecoveryStateForTests,
   resetSkillDiscoveryStateForTests,
 } from "./agent-tools.before-tool-call.js";
 import type { AgentToolResult } from "./runtime/index.js";
@@ -29,6 +31,7 @@ function makeCtxWithSkills(hasSkills: boolean) {
 describe("ClawBackHome Skill Discovery Hooks (Phase 1)", () => {
   beforeEach(() => {
     resetSkillDiscoveryStateForTests();
+    resetFailureRecoveryStateForTests();
   });
 
   it("does not inject guidance when no skills are available in snapshot", () => {
@@ -92,6 +95,7 @@ describe("ClawBackHome Skill Discovery Hooks (Phase 1)", () => {
 describe("ClawBackHome Phase 2: Condensed skill view + Linked file discovery", () => {
   beforeEach(() => {
     resetSkillDiscoveryStateForTests();
+    resetFailureRecoveryStateForTests();
   });
 
   it("getBaseDirFromSkillReadPath extracts dirname for SKILL.md reads", () => {
@@ -116,5 +120,146 @@ describe("ClawBackHome Phase 2: Condensed skill view + Linked file discovery", (
     expect(out.startsWith("[Condensed skill view")).toBe(true);
     expect(out.length).toBeLessThan(700); // bounded
     expect(out.includes("Do the thing")).toBe(true);
+  });
+});
+
+describe("ClawBackHome Failure Recovery Hooks (last-3-step window)", () => {
+  beforeEach(() => {
+    resetFailureRecoveryStateForTests();
+  });
+
+  it("does not trigger on normal short sequences (<3 repeats or <2 failures)", () => {
+    const input = makeTextResult("ok result");
+    const ctx = {};
+    // step 1: foo success
+    let out = maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "foo",
+      params: {},
+      ctx,
+      rawResult: input,
+      hadPostFailure: false,
+    });
+    expect(out).toBe(input);
+    // step 2: foo success again (2x same, not yet 3)
+    out = maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "foo",
+      params: {},
+      ctx,
+      rawResult: input,
+      hadPostFailure: false,
+    });
+    expect(out).toBe(input);
+    // step 3: bar (different) — no 3x same, no 2 fails
+    out = maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "bar",
+      params: {},
+      ctx,
+      rawResult: input,
+      hadPostFailure: false,
+    });
+    expect(out).toBe(input);
+  });
+
+  it("triggers [SYSTEM] guidance on 3x repetitive same tool usage", () => {
+    const input = makeTextResult("result from repeated tool");
+    const ctx = {};
+    // first two no trigger
+    maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "read",
+      params: {},
+      ctx,
+      rawResult: input,
+      hadPostFailure: false,
+    });
+    maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "read",
+      params: {},
+      ctx,
+      rawResult: input,
+      hadPostFailure: false,
+    });
+    // 3rd triggers
+    const out = maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "read",
+      params: {},
+      ctx,
+      rawResult: input,
+      hadPostFailure: false,
+    });
+    expect(out).not.toBe(input);
+    const text = (out.content[0] as any).text as string;
+    expect(text).toContain("[Guidance]");
+    expect(text).toContain("[SYSTEM] Failure Recovery");
+    expect(text).toContain("Repetitive tool usage");
+    expect(text).toContain("get_goal");
+    expect(text).toContain("update_plan");
+    expect(text).toContain("replan");
+    expect((out.details as any)?.guidanceInjected).toBe(true);
+    expect((out.details as any)?.guidanceReason).toContain("failure_recovery_repetitive");
+  });
+
+  it("triggers on repeated failures (2+ in short window) even without 3x repeat", () => {
+    const failResult = {
+      content: [{ type: "text" as const, text: "Error: something failed" }],
+      details: { exitCode: 1 },
+    } as AgentToolResult<unknown>;
+    const okInput = makeTextResult("later success");
+    const ctx = {};
+    // fail 1
+    maybeAddFailureRecoveryGuidanceForTests(failResult, {
+      toolName: "exec",
+      params: {},
+      ctx,
+      rawResult: failResult,
+      hadPostFailure: true,
+    });
+    // success (different tool) — still 1 fail so far
+    maybeAddFailureRecoveryGuidanceForTests(okInput, {
+      toolName: "other",
+      params: {},
+      ctx,
+      rawResult: okInput,
+      hadPostFailure: false,
+    });
+    // fail 2 on exec -> now 2 failures in window -> trigger
+    const out = maybeAddFailureRecoveryGuidanceForTests(failResult, {
+      toolName: "exec",
+      params: {},
+      ctx,
+      rawResult: failResult,
+      hadPostFailure: true,
+    });
+    const text = (out.content[0] as any).text as string;
+    expect(text).toContain("[SYSTEM] Failure Recovery");
+    expect(text).toContain("Repeated tool execution failures");
+    expect(text).toContain("get_goal");
+    expect(text).toContain("update_plan");
+  });
+
+  it("reset clears state so patterns can retrigger in fresh test", () => {
+    const ctx = {};
+    const input = makeTextResult("x");
+    // build toward repeat
+    maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "baz",
+      params: {},
+      ctx,
+      rawResult: input,
+    });
+    maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "baz",
+      params: {},
+      ctx,
+      rawResult: input,
+    });
+    resetFailureRecoveryStateForTests();
+    // after reset, 3rd should NOT trigger (state cleared, only 1 now)
+    const out = maybeAddFailureRecoveryGuidanceForTests(input, {
+      toolName: "baz",
+      params: {},
+      ctx,
+      rawResult: input,
+    });
+    expect(out).toBe(input);
   });
 });

@@ -236,6 +236,8 @@ export function isBeforeToolCallBlockedError(err: unknown): err is BeforeToolCal
 // Pre-call: detect complex escaping in exec and steer to execute_python without running.
 // Post-failure + Progress Tracking: append recovery + auto [SYSTEM Progress Summary] every N steps
 // (captures last update_plan for trusted recap; all skills benefit via get_goal/update_plan protocol).
+// Failure Recovery Hooks: short 3-step window detection of Tool Execution Failure + Repetitive Tool Usage;
+// injects [SYSTEM] guidance nudging get_goal + update_plan replan (prevents long stuck retries/loops).
 // Skill Discovery (Phase 1) + condensed views (Phase 2): proactive nudges and summaries. Reuses patterns.
 
 type GuidanceContext = {
@@ -542,6 +544,208 @@ export function maybeAddProgressTrackingSummaryForTests(
   callCtx: { toolName: string; params: unknown; ctx?: HookContext },
 ): AgentToolResult<unknown> {
   return maybeAddProgressTrackingSummary(current, callCtx);
+}
+
+// --- Failure Recovery Hooks (ClawBackHome small-model support) ---
+// Lightweight, last-3-steps only detection for the two locked patterns (Tool Execution Failure + Repetitive Tool Usage).
+// Pure additive guidance via existing runStepCounters + enrichToolResultWithGuidance + bounded-map pattern (no new files, no config, no public surface).
+// Reuses getRunStepKey, increment (via progress path), plan capture side-effects, and [SYSTEM] trust convention from AGENTS.md.
+// Design: window=3 (hard req); trigger on (a) all 3 identical tool OR (b) >=2 failures in the 3-step window (consecutive or not).
+// On trigger: [SYSTEM] prefix + "phenomenon observed + call get_goal + update_plan immediately to replan". No strategy hints, no skill names.
+// Fully skill-agnostic (chunking-aggregation and all others using get_goal/update_plan contract benefit equally).
+// Failure for a step: extends the post-failure details check (exit/status/stderr) + generic content signals; thrown core errors surface as model-visible error results and count toward repeat/fail on subsequent results.
+// Bounded maps auto-evict; test reset exported for isolation. Ephemeral only.
+
+const FAILURE_RECOVERY_WINDOW = 3;
+const MAX_TRACKED_FAILURE_RECOVERY_RUNS = 256;
+
+type RecentOutcome = {
+  toolName: string;
+  failed: boolean;
+  step: number;
+};
+
+const recentOutcomesByRun = new Map<string, RecentOutcome[]>();
+
+/** Test-only reset (keeps maps bounded and tests isolated; follows existing pattern for plan/skill state). */
+export function resetFailureRecoveryStateForTests(): void {
+  recentOutcomesByRun.clear();
+}
+
+function updateRecentOutcomes(
+  ctx: HookContext | undefined,
+  toolName: string,
+  failed: boolean,
+  step: number,
+): RecentOutcome[] {
+  const key = getRunStepKey(ctx);
+  const prev = recentOutcomesByRun.get(key) ?? [];
+  const next = [...prev, { toolName, failed, step }].slice(-FAILURE_RECOVERY_WINDOW);
+  recentOutcomesByRun.set(key, next);
+  if (recentOutcomesByRun.size > MAX_TRACKED_FAILURE_RECOVERY_RUNS) {
+    const oldest = recentOutcomesByRun.keys().next().value;
+    if (oldest) {
+      recentOutcomesByRun.delete(oldest);
+    }
+  }
+  return next;
+}
+
+function isResultIndicatingFailure(result: AgentToolResult<unknown> | undefined): boolean {
+  if (!result) {
+    return false;
+  }
+  // Reuse/extend the details-based failure signals from existing post-failure guidance.
+  if (isPlainObject(result.details)) {
+    const details = result.details;
+    const exitCode =
+      typeof details.exitCode === "number"
+        ? details.exitCode
+        : typeof details.exit_code === "number"
+          ? details.exit_code
+          : null;
+    const status = details.status;
+    const aggregated = typeof details.aggregated === "string" ? details.aggregated : "";
+    const stderr = typeof details.stderr === "string" ? details.stderr : "";
+    const errText = String(
+      typeof details.error === "string"
+        ? details.error
+        : typeof details.message === "string"
+          ? details.message
+          : typeof details.cause === "string"
+            ? details.cause
+            : "",
+    ).toLowerCase();
+    const combined = `${aggregated}\n${stderr}\n${errText}`.toLowerCase();
+    if (
+      (exitCode != null && exitCode !== 0) ||
+      status === "failed" ||
+      status === "error" ||
+      combined.includes("syntaxerror") ||
+      combined.includes("unexpected eof") ||
+      combined.includes("traceback") ||
+      combined.includes("error") ||
+      combined.includes("failed")
+    ) {
+      return true;
+    }
+  }
+  // Fallback for generic error-shaped results (e.g. core error tool results with text payload).
+  const textContent = result.content?.find(
+    (c): c is { type: "text"; text: string } => c?.type === "text",
+  );
+  const textBlock = (textContent?.text || "").toLowerCase();
+  if (
+    textBlock.startsWith("error") ||
+    textBlock.includes("tool failed") ||
+    textBlock.includes("execution failed") ||
+    textBlock.includes("exception")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function detectFailureRecoveryPattern(outcomes: RecentOutcome[]): {
+  trigger: boolean;
+  reason: string;
+  details: string;
+} {
+  if (outcomes.length < 2) {
+    return { trigger: false, reason: "", details: "" };
+  }
+  const window = outcomes.slice(-FAILURE_RECOVERY_WINDOW);
+  const last = window[window.length - 1];
+  const failCount = window.filter((o) => o.failed).length;
+  const sameCount = window.filter((o) => o.toolName === last.toolName).length;
+  const hasConsecutiveRepeat =
+    window.length >= 2 && window[window.length - 2].toolName === last.toolName;
+
+  // Locked req: only these two patterns, short window.
+  const isRepetitive = window.length >= 3 && sameCount === 3;
+  const hasRepeatedFailures = failCount >= 2;
+
+  if (isRepetitive && hasRepeatedFailures) {
+    return {
+      trigger: true,
+      reason: "repetitive_failure",
+      details: `3x ${last.toolName} with ${failCount} failures in window`,
+    };
+  }
+  if (isRepetitive) {
+    return {
+      trigger: true,
+      reason: "repetitive_tool_usage",
+      details: `3x identical tool ${last.toolName} in last 3 steps`,
+    };
+  }
+  if (hasRepeatedFailures) {
+    return {
+      trigger: true,
+      reason: "repeated_tool_failure",
+      details: `${failCount} failures involving ${last.toolName} in last ${window.length} steps`,
+    };
+  }
+  // Also catch 2x consecutive same + recent failure (short-window stuck retry on error).
+  if (hasConsecutiveRepeat && last.failed && window.length >= 2) {
+    return {
+      trigger: true,
+      reason: "consecutive_failure_retry",
+      details: `consecutive ${last.toolName} with failure`,
+    };
+  }
+  return { trigger: false, reason: "", details: "" };
+}
+
+function maybeAddFailureRecoveryGuidance(
+  current: AgentToolResult<unknown>,
+  callCtx: {
+    toolName: string;
+    params: unknown;
+    ctx?: HookContext;
+    rawResult?: AgentToolResult<unknown>;
+    hadPostFailure?: boolean;
+  },
+): AgentToolResult<unknown> {
+  const step = runStepCounters.get(getRunStepKey(callCtx.ctx)) ?? 0;
+  const failed = callCtx.hadPostFailure === true || isResultIndicatingFailure(callCtx.rawResult);
+  const recent = updateRecentOutcomes(callCtx.ctx, callCtx.toolName, failed, step);
+  const pattern = detectFailureRecoveryPattern(recent);
+  if (!pattern.trigger) {
+    return current;
+  }
+  const phenomenon =
+    pattern.reason === "repetitive_tool_usage"
+      ? `Repetitive tool usage: "${callCtx.toolName}" called ${sameCountFor(recent, callCtx.toolName)} times in last ${recent.length} steps.`
+      : pattern.reason === "repetitive_failure" || pattern.reason === "consecutive_failure_retry"
+        ? `Tool execution failure pattern on "${callCtx.toolName}" (${pattern.details}).`
+        : `Repeated tool execution failures (${pattern.details}).`;
+  const text =
+    `[SYSTEM] Failure Recovery: ${phenomenon} This is a short-window ineffective retry/loop. ` +
+    `Immediately call get_goal to reload the true objective, then update_plan to replan recovery steps. ` +
+    `Do not continue the same tool calls.`;
+  const decision: GuidanceDecision = {
+    text,
+    reason: `failure_recovery_${pattern.reason}`,
+  };
+  return enrichToolResultWithGuidance(current, decision);
+}
+
+function sameCountFor(outcomes: RecentOutcome[], tool: string): number {
+  return outcomes.filter((o) => o.toolName === tool).length;
+}
+
+export function maybeAddFailureRecoveryGuidanceForTests(
+  current: AgentToolResult<unknown>,
+  callCtx: {
+    toolName: string;
+    params: unknown;
+    ctx?: HookContext;
+    rawResult?: AgentToolResult<unknown>;
+    hadPostFailure?: boolean;
+  },
+): AgentToolResult<unknown> {
+  return maybeAddFailureRecoveryGuidance(current, callCtx);
 }
 
 // --- Skill Discovery Hooks (ClawBackHome Phase 1) ---
@@ -1673,6 +1877,17 @@ export function wrapToolWithBeforeToolCallHook(
           toolName,
           params: executeParams,
           ctx,
+        });
+
+        // Failure Recovery Hooks: after step counter advanced, check last-3 window for the two target patterns
+        // (repetitive same-tool or repeated failures). On match, append [SYSTEM] guidance (via enrich) that
+        // explicitly directs model to get_goal + update_plan replan. Additive, no shape change, all skills.
+        result = maybeAddFailureRecoveryGuidance(result, {
+          toolName,
+          params: executeParams,
+          ctx,
+          rawResult,
+          hadPostFailure: !!postGuidance,
         });
 
         // Skill Discovery (Phase 1): additive proactive nudge on long skill-usage gap when
