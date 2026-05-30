@@ -497,9 +497,10 @@ function recordPlanSummary(ctx?: HookContext, plan?: unknown): void {
   const key = getRunStepKey(ctx);
   const short = plan
     .slice(0, 5)
-    .map((p: any, i: number) => {
-      const sym = p?.status === "in_progress" ? "▶" : p?.status === "completed" ? "✓" : "○";
-      const s = String(p?.step || "")
+    .map((p: unknown, i: number) => {
+      const rec = p as Record<string, unknown> | undefined;
+      const sym = rec?.status === "in_progress" ? "▶" : rec?.status === "completed" ? "✓" : "○";
+      const s = String(rec?.step || "")
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 22);
