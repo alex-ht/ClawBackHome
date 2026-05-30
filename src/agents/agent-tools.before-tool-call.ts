@@ -307,12 +307,18 @@ export function detectComplexExecEscaping(command: unknown): {
 }
 
 function getExecCommandFromParams(params: unknown): string | undefined {
-  if (!isPlainObject(params)) return undefined;
-  const p = params as Record<string, unknown>;
+  if (!isPlainObject(params)) {
+    return undefined;
+  }
+  const p = params;
   const direct = typeof p.command === "string" ? p.command : undefined;
-  if (direct) return direct;
+  if (direct) {
+    return direct;
+  }
   // Some wrappers pass { cmd, commandLine, ... }
-  if (typeof p.cmd === "string") return p.cmd;
+  if (typeof p.cmd === "string") {
+    return p.cmd;
+  }
   return undefined;
 }
 
@@ -325,7 +331,9 @@ const GUIDANCE_PYTHON_FAILURE =
   "Python execution failed (often due to prior escaping mistakes). Next time use execute_python with the exact source code as a plain string — it removes all shell quoting burden.";
 
 function getPreCallToolGuidance(ctx: GuidanceContext): GuidanceDecision {
-  if (ctx.toolName !== "exec") return null;
+  if (ctx.toolName !== "exec") {
+    return null;
+  }
   const command = getExecCommandFromParams(ctx.params);
   const det = detectComplexExecEscaping(command);
   if (det.detected) {
@@ -340,20 +348,19 @@ function getPreCallToolGuidance(ctx: GuidanceContext): GuidanceDecision {
 
 function getPostFailureToolGuidance(ctx: GuidanceContext): GuidanceDecision {
   const { toolName, result } = ctx;
-  if (!result || !isPlainObject(result.details)) return null;
+  if (!result || !isPlainObject(result.details)) {
+    return null;
+  }
 
-  const details = result.details as Record<string, unknown>;
+  const details = result.details;
   const exitCode =
     typeof details.exitCode === "number"
       ? details.exitCode
-      : typeof (details as Record<string, unknown>).exit_code === "number"
-        ? ((details as Record<string, unknown>).exit_code as number)
+      : typeof details.exit_code === "number"
+        ? details.exit_code
         : null;
   const aggregated = typeof details.aggregated === "string" ? details.aggregated : "";
-  const stderr =
-    typeof (details as Record<string, unknown>).stderr === "string"
-      ? ((details as Record<string, unknown>).stderr as string)
-      : "";
+  const stderr = typeof details.stderr === "string" ? details.stderr : "";
   const combined = `${aggregated}\n${stderr}`.toLowerCase();
 
   const isFailure =
@@ -362,7 +369,9 @@ function getPostFailureToolGuidance(ctx: GuidanceContext): GuidanceDecision {
     combined.includes("syntaxerror") ||
     combined.includes("unexpected eof");
 
-  if (!isFailure) return null;
+  if (!isFailure) {
+    return null;
+  }
 
   if (toolName === "exec" || toolName === "execute_python") {
     const command = getExecCommandFromParams(ctx.params);
@@ -404,7 +413,9 @@ function enrichToolResultWithGuidance(
   original: AgentToolResult<unknown>,
   decision: GuidanceDecision,
 ): AgentToolResult<unknown> {
-  if (!decision?.text) return original;
+  if (!decision?.text) {
+    return original;
+  }
   const baseText =
     original.content.find((c): c is { type: "text"; text: string } => c.type === "text")?.text ??
     "";
@@ -440,8 +451,12 @@ const MAX_TRACKED_RUN_STEPS = 512;
 const runStepCounters = new Map<string, number>();
 
 function getRunStepKey(ctx?: HookContext): string {
-  if (ctx?.runId && ctx.runId.trim()) return `run:${ctx.runId}`;
-  if (ctx?.sessionKey && ctx.sessionKey.trim()) return `sess:${ctx.sessionKey}`;
+  if (ctx?.runId && ctx.runId.trim()) {
+    return `run:${ctx.runId}`;
+  }
+  if (ctx?.sessionKey && ctx.sessionKey.trim()) {
+    return `sess:${ctx.sessionKey}`;
+  }
   return "global";
 }
 
@@ -451,7 +466,9 @@ function incrementRunStep(ctx?: HookContext): number {
   runStepCounters.set(key, next);
   if (runStepCounters.size > MAX_TRACKED_RUN_STEPS) {
     const oldest = runStepCounters.keys().next().value;
-    if (oldest) runStepCounters.delete(oldest);
+    if (oldest) {
+      runStepCounters.delete(oldest);
+    }
   }
   return next;
 }
