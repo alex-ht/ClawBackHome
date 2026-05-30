@@ -234,10 +234,9 @@ export function isBeforeToolCallBlockedError(err: unknown): err is BeforeToolCal
 // Pure, cheap, internal hooks for runtime steering. No public API, no config,
 // no result shape change. Absorbed here (existing hook layer) to avoid new files.
 // Pre-call: detect complex escaping in exec and steer to execute_python without running.
-// Post-failure + periodic: append recovery alts and (every N steps) a re-plan review nudge
-// that directs the model to get_goal + update_plan against the original task.
-// Skill Discovery (Phase 1): proactive nudges on long skill-usage gaps during stuck
-// or complex runs that have skills available in the snapshot. Reuses all prior patterns.
+// Post-failure + Progress Tracking: append recovery + auto [SYSTEM Progress Summary] every N steps
+// (captures last update_plan for trusted recap; all skills benefit via get_goal/update_plan protocol).
+// Skill Discovery (Phase 1) + condensed views (Phase 2): proactive nudges and summaries. Reuses patterns.
 
 type GuidanceContext = {
   toolName: string;
@@ -440,15 +439,18 @@ function enrichToolResultWithGuidance(
   };
 }
 
-// --- Phase 3: lightweight periodic progress review / re-plan nudge (ClawBackHome) ---
-// Absorbed into existing guidance hook layer (no new files, no config, no result shape change).
-// Reuses the exact enrich + GuidanceDecision patterns from Phase 2.
-// After every N tool calls per run, append a short directive nudge that tells the model
-// (especially ≤4B) to review the original task via the shipped get_goal + update_plan surfaces
-// before continuing. Non-intrusive: pure additive text in tool result; model can ignore.
-// Counter is cheap in-memory bounded map (same shape as adjustedParamsByToolCallId).
+// --- Progress Tracking Hooks (ClawBackHome) ---
+// Stronger automatic progress summaries every N steps as trusted [SYSTEM] messages.
+// Reuses exact same lightweight hook layer, runStepCounters, enrichToolResultWithGuidance,
+// GuidanceDecision, and bounded-map pattern as prior phases (no new files, no config, additive only).
+// - Every N tool calls: inject short [SYSTEM Progress Summary @step] (model trusts [SYSTEM] prefix per AGENTS.md).
+// - On every update_plan (from ANY skill): capture ultra-short plan recap from result.details.plan.
+// - Later periodic summaries re-emit the last declared plan as reliable external fact (defeats drift/forgetting).
+// - Fallback generic summary if no plan yet. Short, actionable, ≤4B friendly. Ephemeral only.
+// Fully skill-agnostic (works for chunking-aggregation + all others using the get_goal/update_plan protocol).
+// Counter + maps bounded and shared with Skill Discovery hooks.
 
-const REPLAN_REVIEW_NUDGE_INTERVAL = 7; // periodic but not chatty; tuned for small-model support
+const PROGRESS_TRACKING_INTERVAL = 5; // stronger/frequent recaps for small models; low chattiness
 const MAX_TRACKED_RUN_STEPS = 512;
 
 const runStepCounters = new Map<string, number>();
@@ -476,27 +478,69 @@ function incrementRunStep(ctx?: HookContext): number {
   return next;
 }
 
-const PERIODIC_REPLAN_NUDGE =
-  "Periodic progress review (helps ≤4B models stay on long tasks): " +
-  "Call get_goal to recall the original objective, then update_plan to mark completed steps, " +
-  "confirm the single in_progress step still matches reality, and adjust the remaining plan if the task drifted. " +
-  "Then take the next concrete action.";
+// Last declared plan summary (from update_plan echoes). Bounded, per-run, ephemeral.
+// Enables [SYSTEM] recaps without any persisted plan store or cross-skill coupling.
+const lastPlanSummaryByRun = new Map<string, string>();
+const MAX_TRACKED_PLAN_RUNS = 256;
 
-function maybeAddPeriodicReplanReview(
+/** Test-only reset (keeps maps bounded and tests isolated; follows skill discovery pattern). */
+export function resetPlanTrackingStateForTests(): void {
+  lastPlanSummaryByRun.clear();
+}
+
+export function recordPlanSummaryForTests(ctx?: HookContext, plan?: unknown): void {
+  recordPlanSummary(ctx, plan);
+}
+
+function recordPlanSummary(ctx?: HookContext, plan?: unknown): void {
+  if (!plan || !Array.isArray(plan) || plan.length === 0) return;
+  const key = getRunStepKey(ctx);
+  const short = plan
+    .slice(0, 5)
+    .map((p: any, i: number) => {
+      const sym = p?.status === "in_progress" ? "▶" : p?.status === "completed" ? "✓" : "○";
+      const s = String(p?.step || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 22);
+      return `${i + 1}${sym}${s}`;
+    })
+    .join(" ");
+  const summary = short ? `Plan[${plan.length}]: ${short}${plan.length > 5 ? "…" : ""}` : "";
+  if (summary) {
+    lastPlanSummaryByRun.set(key, summary);
+    if (lastPlanSummaryByRun.size > MAX_TRACKED_PLAN_RUNS) {
+      const oldest = lastPlanSummaryByRun.keys().next().value;
+      if (oldest) lastPlanSummaryByRun.delete(oldest);
+    }
+  }
+}
+
+function maybeAddProgressTrackingSummary(
   current: AgentToolResult<unknown>,
   callCtx: { toolName: string; params: unknown; ctx?: HookContext },
 ): AgentToolResult<unknown> {
   const count = incrementRunStep(callCtx.ctx);
-  if (count % REPLAN_REVIEW_NUDGE_INTERVAL !== 0) {
+  if (count % PROGRESS_TRACKING_INTERVAL !== 0) {
     return current;
   }
-  // Reuse the existing enrich path (it safely appends to content and tags details).
-  // Treat as a guidance decision so the same "tool.execution.guidance" diagnostic fires if enabled.
+  const key = getRunStepKey(callCtx.ctx);
+  const lastPlan = lastPlanSummaryByRun.get(key) ?? "";
+  const text = lastPlan
+    ? `[SYSTEM Progress Summary @${count}]\n${lastPlan}\nIf drifted: get_goal + update_plan. Next concrete step.`
+    : `[SYSTEM Progress Summary @${count}]\nDeclare goal + first in_progress via get_goal + update_plan. Externalize.`;
   const decision: GuidanceDecision = {
-    text: PERIODIC_REPLAN_NUDGE,
-    reason: "periodic_replan_review",
+    text,
+    reason: "progress_tracking_summary",
   };
   return enrichToolResultWithGuidance(current, decision);
+}
+
+export function maybeAddProgressTrackingSummaryForTests(
+  current: AgentToolResult<unknown>,
+  callCtx: { toolName: string; params: unknown; ctx?: HookContext },
+): AgentToolResult<unknown> {
+  return maybeAddProgressTrackingSummary(current, callCtx);
 }
 
 // --- Skill Discovery Hooks (ClawBackHome Phase 1) ---
@@ -1611,11 +1655,20 @@ export function wrapToolWithBeforeToolCallHook(
           ? enrichToolResultWithGuidance(rawResult, postGuidance)
           : rawResult;
 
-        // Phase 3: periodic progress review / re-plan nudge (interval-based, lightweight).
-        // After N steps, strongly encourage the model to review the original task (via shipped
-        // get_goal + update_plan) before continuing. Reuses enrich + guidance event path.
-        // Backward compat: only adds text on exact multiples; all other behavior identical.
-        result = maybeAddPeriodicReplanReview(result, {
+        // Progress Tracking capture (any skill): when update_plan succeeds, record its declared plan
+        // (echoed in details.plan). This feeds the next [SYSTEM Progress Summary] recap. Zero new state files.
+        if (toolName === "update_plan") {
+          const details = (rawResult as unknown as Record<string, unknown> | undefined)?.details as
+            | Record<string, unknown>
+            | undefined;
+          const declaredPlan = details?.plan;
+          recordPlanSummary(ctx, declaredPlan);
+        }
+
+        // Progress Tracking Hooks: every N steps, inject short trusted [SYSTEM Progress Summary]
+        // (with last plan if known, else setup reminder). Replaces prior nudge; same enrich path.
+        // Stronger for ≤4B (more frequent + recap of model's own last update_plan). Skill-agnostic.
+        result = maybeAddProgressTrackingSummary(result, {
           toolName,
           params: executeParams,
           ctx,
@@ -1631,9 +1684,8 @@ export function wrapToolWithBeforeToolCallHook(
           ctx,
         });
 
-        // Emit guidance diagnostic for Phase 3 periodic replan nudges (and post-failure).
-        // The enrich path sets details; this makes the "tool.execution.guidance" event fire
-        // for periodic_replan_review as the section comment intended.
+        // Emit guidance diagnostic for progress summaries (and post-failure, other guidances).
+        // The enrich path sets details; reason "progress_tracking_summary" etc. will fire the event.
         const guidanceReasonForEmit =
           ((result.details as Record<string, unknown> | undefined)?.guidanceReason as
             | string
