@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -564,6 +565,122 @@ function maybeAddSkillDiscoveryGuidance(
     reason: "skill_discovery_proactive",
   };
   return enrichToolResultWithGuidance(current, decision);
+}
+
+// --- Phase 2: Condensed skill summaries + Automatic Linked File Discovery (ClawBackHome) ---
+// Absorbed into the same lightweight hook layer (no new public tools, no config,
+// no read-tool mutation, no result shape change for callers that ignore guidance text).
+// When a skill SKILL.md is read (detected via the existing findSkillUsageMatch path),
+// we append a short structured [Condensed skill view] + bounded list of references/,
+// scripts/, templates/, examples/ etc. so ≤4B models do not need to guess paths.
+// Pure additive text via the same enrich path used by all prior ClawBackHome phases.
+// Bounded, cheap fs + string slicing only. Progressive disclosure: summary first,
+// full raw content remains in the original read result.
+
+function getBaseDirFromSkillReadPath(toolParams: unknown, ctx?: HookContext): string | undefined {
+  const candidates = readToolPathCandidates(toolParams, ctx);
+  for (const p of candidates) {
+    if (p.endsWith("/SKILL.md") || p.endsWith("\\SKILL.md") || p === "SKILL.md") {
+      try {
+        return path.dirname(p);
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return undefined;
+}
+
+function listSkillLinkedFiles(baseDir: string): string {
+  const known = ["references", "templates", "scripts", "examples", "bin"];
+  const found: string[] = [];
+  for (const sub of known) {
+    const dir = path.join(baseDir, sub);
+    try {
+      const ents = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of ents) {
+        if (e.isFile() && !e.name.startsWith(".")) {
+          found.push(`${sub}/${e.name}`);
+        }
+        if (found.length >= 12) break;
+      }
+    } catch {
+      // Subdir absent or unreadable — normal for most skills.
+    }
+    if (found.length >= 12) break;
+  }
+  if (found.length === 0) return "";
+  const display = found.slice(0, 10).join(", ") + (found.length > 10 ? ", ..." : "");
+  return `\n[Skill files: ${display}]`;
+}
+
+function getCondensedSkillView(rawContent: string, baseDir?: string): string {
+  // Lightweight: drop frontmatter block if present, take first ~500 chars of body.
+  let body = rawContent || "";
+  const firstFm = body.indexOf("---");
+  if (firstFm === 0) {
+    const end = body.indexOf("---", 4);
+    if (end > 4 && end < 4000) {
+      body = body.slice(end + 3);
+    }
+  }
+  const head = body.replace(/\s+/g, " ").trim().slice(0, 500);
+  const truncated = body.length > 500 ? " … (full body in the read result above)" : "";
+  const files = baseDir ? listSkillLinkedFiles(baseDir) : "";
+  return `[Condensed skill view — use only if the raw read above is too long]\n${head}${truncated}${files}`;
+}
+
+function maybeEnrichSkillReadWithCondensed(
+  current: AgentToolResult<unknown>,
+  callCtx: {
+    toolName: string;
+    params: unknown;
+    ctx?: HookContext;
+    result?: AgentToolResult<unknown>;
+  },
+): AgentToolResult<unknown> {
+  // Only for reads that matched a skill (activation: 'read').
+  // We detect via the same findSkillUsageMatch used for telemetry.
+  const match = findSkillUsageMatch({
+    toolName: callCtx.toolName,
+    toolParams: callCtx.params,
+    ctx: callCtx.ctx,
+  });
+  if (!match || match.activation !== "read") {
+    return current;
+  }
+
+  const baseDir = getBaseDirFromSkillReadPath(callCtx.params, callCtx.ctx);
+  // Extract the primary text the read returned (before or after prior guidance appends).
+  const textBlock =
+    (callCtx.result?.content?.find((c: any) => c && c.type === "text") as any)?.text ||
+    (current.content?.find((c: any) => c && c.type === "text") as any)?.text ||
+    "";
+  if (!textBlock) {
+    return current;
+  }
+
+  const condensed = getCondensedSkillView(textBlock, baseDir);
+  if (!condensed) return current;
+
+  const decision: GuidanceDecision = {
+    text: condensed,
+    reason: "skill_read_condensed",
+  };
+  return enrichToolResultWithGuidance(current, decision);
+}
+
+export function getCondensedSkillViewForTests(raw: string, baseDir?: string): string {
+  return getCondensedSkillView(raw, baseDir);
+}
+export function listSkillLinkedFilesForTests(baseDir: string): string {
+  return listSkillLinkedFiles(baseDir);
+}
+export function getBaseDirFromSkillReadPathForTests(
+  params: unknown,
+  ctx?: HookContext,
+): string | undefined {
+  return getBaseDirFromSkillReadPath(params, ctx);
 }
 
 const loadBeforeToolCallRuntime = createLazyRuntimeSurface(
@@ -1540,6 +1657,17 @@ export function wrapToolWithBeforeToolCallHook(
           // read activations and command dispatches. Enables gap-based proactive nudges.
           recordSkillUsage(ctx);
         }
+
+        // Phase 2: when this tool result was a skill read, append condensed structured
+        // view + auto-discovered linked files (references/, scripts/, etc.).
+        // Reuses the exact same enrich path and GuidanceDecision shape. The original
+        // raw read content is preserved; only guidance text is appended. Model can ignore.
+        result = maybeEnrichSkillReadWithCondensed(result, {
+          toolName: normalizedToolName,
+          params: executeParams,
+          ctx,
+          result,
+        });
         if (hookOptions.emitDiagnostics) {
           if (guidanceReasonForEmit) {
             emitTrustedDiagnosticEvent({

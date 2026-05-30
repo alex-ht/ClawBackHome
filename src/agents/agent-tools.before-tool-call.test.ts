@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
+  getBaseDirFromSkillReadPathForTests,
+  getCondensedSkillViewForTests,
+  listSkillLinkedFilesForTests,
   maybeAddSkillDiscoveryGuidanceForTests,
   recordSkillUsageForTests,
   resetSkillDiscoveryStateForTests,
@@ -83,5 +86,35 @@ describe("ClawBackHome Skill Discovery Hooks (Phase 1)", () => {
         ctx,
       }),
     ).not.toThrow();
+  });
+});
+
+describe("ClawBackHome Phase 2: Condensed skill view + Linked file discovery", () => {
+  beforeEach(() => {
+    resetSkillDiscoveryStateForTests();
+  });
+
+  it("getBaseDirFromSkillReadPath extracts dirname for SKILL.md reads", () => {
+    const dir = getBaseDirFromSkillReadPathForTests(
+      { path: "/workspace/skills/weather/SKILL.md" },
+      {},
+    );
+    expect(dir).toBe("/workspace/skills/weather");
+  });
+
+  it("listSkillLinkedFiles returns bounded list or empty when no subdirs (safe, no throw)", () => {
+    const out = listSkillLinkedFilesForTests("/tmp/nonexistent-skill-dir-xyz");
+    expect(typeof out).toBe("string");
+    // Either empty or a short [Skill files: ...] string
+    expect(out === "" || out.includes("Skill files")).toBe(true);
+  });
+
+  it("getCondensedSkillView produces short structured output and includes linked files when present", () => {
+    const fakeMd =
+      "---\nname: test\n---\n\n## Usage\nDo the thing with the tool.\n\nLong body that should be truncated in the condensed view because small models get overwhelmed by the full raw SKILL.md content that the read tool still returns verbatim above this guidance.";
+    const out = getCondensedSkillViewForTests(fakeMd, "/tmp/some-skill");
+    expect(out.startsWith("[Condensed skill view")).toBe(true);
+    expect(out.length).toBeLessThan(700); // bounded
+    expect(out.includes("Do the thing")).toBe(true);
   });
 });
