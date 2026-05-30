@@ -233,7 +233,8 @@ export function isBeforeToolCallBlockedError(err: unknown): err is BeforeToolCal
 // Pure, cheap, internal hooks for runtime steering. No public API, no config,
 // no result shape change. Absorbed here (existing hook layer) to avoid new files.
 // Pre-call: detect complex escaping in exec and steer to execute_python without running.
-// Post-failure: append recovery alternatives. Reuses loop state for lightweight re-plan hint.
+// Post-failure + periodic: append recovery alts and (every N steps) a re-plan review nudge
+// that directs the model to get_goal + update_plan against the original task.
 
 type GuidanceContext = {
   toolName: string;
@@ -423,6 +424,59 @@ function enrichToolResultWithGuidance(
       guidanceReason: decision.reason,
     },
   };
+}
+
+// --- Phase 3: lightweight periodic progress review / re-plan nudge (ClawBackHome) ---
+// Absorbed into existing guidance hook layer (no new files, no config, no result shape change).
+// Reuses the exact enrich + GuidanceDecision patterns from Phase 2.
+// After every N tool calls per run, append a short directive nudge that tells the model
+// (especially ≤4B) to review the original task via the shipped get_goal + update_plan surfaces
+// before continuing. Non-intrusive: pure additive text in tool result; model can ignore.
+// Counter is cheap in-memory bounded map (same shape as adjustedParamsByToolCallId).
+
+const REPLAN_REVIEW_NUDGE_INTERVAL = 7; // periodic but not chatty; tuned for small-model support
+const MAX_TRACKED_RUN_STEPS = 512;
+
+const runStepCounters = new Map<string, number>();
+
+function getRunStepKey(ctx?: HookContext): string {
+  if (ctx?.runId && ctx.runId.trim()) return `run:${ctx.runId}`;
+  if (ctx?.sessionKey && ctx.sessionKey.trim()) return `sess:${ctx.sessionKey}`;
+  return "global";
+}
+
+function incrementRunStep(ctx?: HookContext): number {
+  const key = getRunStepKey(ctx);
+  const next = (runStepCounters.get(key) ?? 0) + 1;
+  runStepCounters.set(key, next);
+  if (runStepCounters.size > MAX_TRACKED_RUN_STEPS) {
+    const oldest = runStepCounters.keys().next().value;
+    if (oldest) runStepCounters.delete(oldest);
+  }
+  return next;
+}
+
+const PERIODIC_REPLAN_NUDGE =
+  "Periodic progress review (helps ≤4B models stay on long tasks): " +
+  "Call get_goal to recall the original objective, then update_plan to mark completed steps, " +
+  "confirm the single in_progress step still matches reality, and adjust the remaining plan if the task drifted. " +
+  "Then take the next concrete action.";
+
+function maybeAddPeriodicReplanReview(
+  current: AgentToolResult<unknown>,
+  callCtx: { toolName: string; params: unknown; ctx?: HookContext },
+): AgentToolResult<unknown> {
+  const count = incrementRunStep(callCtx.ctx);
+  if (count % REPLAN_REVIEW_NUDGE_INTERVAL !== 0) {
+    return current;
+  }
+  // Reuse the existing enrich path (it safely appends to content and tags details).
+  // Treat as a guidance decision so the same "tool.execution.guidance" diagnostic fires if enabled.
+  const decision: GuidanceDecision = {
+    text: PERIODIC_REPLAN_NUDGE,
+    reason: "periodic_replan_review",
+  };
+  return enrichToolResultWithGuidance(current, decision);
 }
 
 const loadBeforeToolCallRuntime = createLazyRuntimeSurface(
@@ -1349,9 +1403,27 @@ export function wrapToolWithBeforeToolCallHook(
           result: rawResult,
           ctx,
         });
-        const result = postGuidance
+        let result = postGuidance
           ? enrichToolResultWithGuidance(rawResult, postGuidance)
           : rawResult;
+
+        // Phase 3: periodic progress review / re-plan nudge (interval-based, lightweight).
+        // After N steps, strongly encourage the model to review the original task (via shipped
+        // get_goal + update_plan) before continuing. Reuses enrich + guidance event path.
+        // Backward compat: only adds text on exact multiples; all other behavior identical.
+        result = maybeAddPeriodicReplanReview(result, {
+          toolName,
+          params: executeParams,
+          ctx,
+        });
+
+        // Emit guidance diagnostic for Phase 3 periodic replan nudges (and post-failure).
+        // The enrich path sets details; this makes the "tool.execution.guidance" event fire
+        // for periodic_replan_review as the section comment intended.
+        const guidanceReasonForEmit =
+          ((result.details as Record<string, unknown> | undefined)?.guidanceReason as
+            | string
+            | undefined) ?? postGuidance?.reason;
 
         const durationMs = Date.now() - startedAt;
         await recordLoopOutcome({
@@ -1367,7 +1439,7 @@ export function wrapToolWithBeforeToolCallHook(
           ctx,
         });
         if (hookOptions.emitDiagnostics) {
-          if (postGuidance) {
+          if (guidanceReasonForEmit) {
             emitTrustedDiagnosticEvent({
               type: "tool.execution.guidance",
               ...(ctx?.runId && { runId: ctx.runId }),
@@ -1377,7 +1449,7 @@ export function wrapToolWithBeforeToolCallHook(
               ...diagnosticIdentity,
               ...(toolCallId && { toolCallId }),
               paramsSummary: summarizeToolParams(executeParams),
-              reason: postGuidance.reason,
+              reason: guidanceReasonForEmit,
             });
           }
           if (skillMatch) {
