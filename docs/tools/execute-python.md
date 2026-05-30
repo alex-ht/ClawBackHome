@@ -91,6 +91,8 @@ With cwd and env:
 
 When the task requires complex shell scripting or temporary logic that involves tricky string escaping (especially `bash -c`, `python -c`, complex `awk`, etc.), prefer `execute_python` over the `exec` tool.
 
+Runtime Tool Usage Guidance Hooks (in the agent tool wrapper layer) now actively detect complex escaping patterns in exec calls at runtime and return immediate steering text pointing to `execute_python` without executing the problematic command. On Python-related failures the same hooks append concrete recovery alternatives. This is the active half of the ClawBackHome approach for ≤4B models.
+
 The `exec` tool description also contains this reminder.
 
 If Python is not installed, the result contains concrete next steps (full paths for `exec`, install instructions, Windows `py` launcher).

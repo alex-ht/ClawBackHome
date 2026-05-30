@@ -51,6 +51,7 @@ import {
   normalizeCodeModeExecBeforeHookParamsForToolKind,
   reconcileCodeModeExecBeforeHookParams,
 } from "./code-mode-control-tools.js";
+import type { AgentToolResult } from "./runtime/index.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 import { normalizeToolName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
@@ -226,6 +227,202 @@ export function recordAdjustedParamsForToolCall(
  */
 export function isBeforeToolCallBlockedError(err: unknown): err is BeforeToolCallBlockedError {
   return err instanceof BeforeToolCallBlockedError;
+}
+
+// --- Tool Usage Guidance Hook system (ClawBackHome small-model support) ---
+// Pure, cheap, internal hooks for runtime steering. No public API, no config,
+// no result shape change. Absorbed here (existing hook layer) to avoid new files.
+// Pre-call: detect complex escaping in exec and steer to execute_python without running.
+// Post-failure: append recovery alternatives. Reuses loop state for lightweight re-plan hint.
+
+type GuidanceContext = {
+  toolName: string;
+  params: unknown;
+  result?: AgentToolResult<unknown>;
+  ctx?: HookContext;
+};
+
+type GuidanceDecision = {
+  text: string;
+  reason: string;
+  suggestedTool?: string;
+} | null;
+
+/** Detects exec commands with escaping patterns that reliably break ≤4B models. */
+export function detectComplexExecEscaping(command: unknown): {
+  detected: boolean;
+  reason?: string;
+  suggestedTool?: string;
+} {
+  if (typeof command !== "string" || !command.trim()) {
+    return { detected: false };
+  }
+  const raw = command;
+  const lower = raw.toLowerCase();
+  const hasPythonC = /python3?\s+-c\s+/.test(lower);
+  const hasBashC = /bash\s+-c\s+/.test(lower);
+  if (!hasPythonC && !hasBashC) {
+    return { detected: false };
+  }
+
+  // Score-based heuristics (why: small models botch nested quotes / long -c far more than simple commands).
+  // Contract: only high-confidence patterns trigger; false positives are cheap no-ops.
+  let score = 0;
+  const reasons: string[] = [];
+  if (/\\["']/.test(raw)) {
+    score += 2;
+    reasons.push("backslash-escaped quotes");
+  }
+  if (/"[^"]*\\"/.test(raw) || /'[^']*\\'/.test(raw)) {
+    score += 2;
+    reasons.push("nested escaped quotes");
+  }
+  if (hasPythonC && raw.length > 120) {
+    score += 1;
+    reasons.push("long python -c payload");
+  }
+  if (hasBashC && /python3?\s+-c/.test(lower)) {
+    score += 3;
+    reasons.push("bash -c wrapping python -c");
+  }
+  const quoteCount = (raw.match(/["']/g) || []).length;
+  if (quoteCount > 6) {
+    score += 1;
+    reasons.push("high quote count");
+  }
+  if (hasPythonC && /;\s*python|&&\s*python|eval\(/.test(lower)) {
+    score += 1;
+    reasons.push("chained python via shell");
+  }
+
+  if (score >= 3) {
+    return {
+      detected: true,
+      reason: reasons.join(", "),
+      suggestedTool: "execute_python",
+    };
+  }
+  return { detected: false };
+}
+
+function getExecCommandFromParams(params: unknown): string | undefined {
+  if (!isPlainObject(params)) return undefined;
+  const p = params as Record<string, unknown>;
+  const direct = typeof p.command === "string" ? p.command : undefined;
+  if (direct) return direct;
+  // Some wrappers pass { cmd, commandLine, ... }
+  if (typeof p.cmd === "string") return p.cmd;
+  return undefined;
+}
+
+const GUIDANCE_EXEC_ESCAPING =
+  "Complex shell escaping detected in exec command (nested quotes, long python -c, or bash -c wrapping python). " +
+  "Small models (≤4B) reliably fail at this. Use the dedicated execute_python tool instead: pass raw multi-line Python source in the `code` parameter — no quoting or escaping required. " +
+  "The tool returns structured {stdout, stderr, exit_code, duration}.";
+
+const GUIDANCE_PYTHON_FAILURE =
+  "Python execution failed (often due to prior escaping mistakes). Next time use execute_python with the exact source code as a plain string — it removes all shell quoting burden.";
+
+function getPreCallToolGuidance(ctx: GuidanceContext): GuidanceDecision {
+  if (ctx.toolName !== "exec") return null;
+  const command = getExecCommandFromParams(ctx.params);
+  const det = detectComplexExecEscaping(command);
+  if (det.detected) {
+    return {
+      text: GUIDANCE_EXEC_ESCAPING + (det.reason ? ` Detected pattern: ${det.reason}.` : ""),
+      reason: det.reason || "complex escaping",
+      suggestedTool: det.suggestedTool,
+    };
+  }
+  return null;
+}
+
+function getPostFailureToolGuidance(ctx: GuidanceContext): GuidanceDecision {
+  const { toolName, result } = ctx;
+  if (!result || !isPlainObject(result.details)) return null;
+
+  const details = result.details as Record<string, unknown>;
+  const exitCode =
+    typeof details.exitCode === "number"
+      ? details.exitCode
+      : typeof (details as Record<string, unknown>).exit_code === "number"
+        ? ((details as Record<string, unknown>).exit_code as number)
+        : null;
+  const aggregated = typeof details.aggregated === "string" ? details.aggregated : "";
+  const stderr =
+    typeof (details as Record<string, unknown>).stderr === "string"
+      ? ((details as Record<string, unknown>).stderr as string)
+      : "";
+  const combined = `${aggregated}\n${stderr}`.toLowerCase();
+
+  const isFailure =
+    (exitCode != null && exitCode !== 0) ||
+    details.status === "failed" ||
+    combined.includes("syntaxerror") ||
+    combined.includes("unexpected eof");
+
+  if (!isFailure) return null;
+
+  if (toolName === "exec" || toolName === "execute_python") {
+    const command = getExecCommandFromParams(ctx.params);
+    const wasPythonAttempt =
+      toolName === "exec" && /python3?\s+-c/.test((command || "").toLowerCase());
+    if (wasPythonAttempt || toolName === "execute_python" || combined.includes("python")) {
+      return {
+        text: GUIDANCE_PYTHON_FAILURE,
+        reason: "python failure suggesting escaping issue",
+        suggestedTool: "execute_python",
+      };
+    }
+    // Generic exec failure recovery hint (lightweight)
+    return {
+      text: "Tool failed. For Python logic, prefer execute_python to avoid quoting errors entirely.",
+      reason: "generic exec failure",
+    };
+  }
+  return null;
+}
+
+function buildGuidanceResult(
+  decision: GuidanceDecision,
+  originalParams: unknown,
+): AgentToolResult<unknown> {
+  const text = decision?.text ?? "Use the recommended tool for this task.";
+  return {
+    content: [{ type: "text" as const, text }],
+    details: {
+      status: "guidance",
+      reason: decision?.reason,
+      suggestedTool: decision?.suggestedTool,
+      originalParamsSummary: summarizeToolParams(originalParams),
+    },
+  };
+}
+
+function enrichToolResultWithGuidance(
+  original: AgentToolResult<unknown>,
+  decision: GuidanceDecision,
+): AgentToolResult<unknown> {
+  if (!decision?.text) return original;
+  const baseText =
+    original.content.find((c): c is { type: "text"; text: string } => c.type === "text")?.text ??
+    "";
+  const appended = baseText
+    ? `${baseText}\n\n[Guidance] ${decision.text}`
+    : `[Guidance] ${decision.text}`;
+  const newContent = [
+    { type: "text" as const, text: appended },
+    ...original.content.filter((c) => c.type !== "text"),
+  ];
+  return {
+    ...original,
+    content: newContent,
+    details: {
+      ...(original.details as Record<string, unknown>),
+      guidanceInjected: true,
+      guidanceReason: decision.reason,
+    },
+  };
 }
 
 const loadBeforeToolCallRuntime = createLazyRuntimeSurface(
@@ -1083,6 +1280,7 @@ export function wrapToolWithBeforeToolCallHook(
         });
         return blockedResult;
       }
+
       const executeParams = reconcileCodeModeExecBeforeHookParams({
         tool,
         originalParams: params,
@@ -1090,7 +1288,37 @@ export function wrapToolWithBeforeToolCallHook(
         adjustedParams: outcome.params,
       });
       recordAdjustedParamsForToolCall(toolCallId, executeParams, ctx?.runId);
+
       const normalizedToolName = normalizeToolName(toolName || "tool");
+
+      // Core Tool Usage Guidance Hook (pre-call): after plugin hooks, before real execution.
+      // Detects escaping patterns in exec and returns steering result (model sees helpful text, command never runs).
+      // Backward compat: only affects matching bad patterns; all other calls unchanged.
+      const preGuidance = getPreCallToolGuidance({ toolName, params: executeParams, ctx });
+      if (preGuidance) {
+        const guidanceResult = buildGuidanceResult(preGuidance, executeParams);
+        await recordLoopOutcome({
+          ctx,
+          toolName: normalizedToolName,
+          toolParams: executeParams,
+          toolCallId,
+          result: guidanceResult,
+        });
+        if (hookOptions.emitDiagnostics) {
+          emitTrustedDiagnosticEvent({
+            type: "tool.execution.guidance",
+            ...(ctx?.runId && { runId: ctx.runId }),
+            ...(ctx?.sessionKey && { sessionKey: ctx.sessionKey }),
+            ...(ctx?.sessionId && { sessionId: ctx.sessionId }),
+            toolName: normalizedToolName,
+            ...diagnosticIdentity,
+            ...(toolCallId && { toolCallId }),
+            paramsSummary: summarizeToolParams(executeParams),
+            reason: preGuidance.reason,
+          });
+        }
+        return guidanceResult;
+      }
       const trace = ctx?.trace
         ? freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(ctx.trace))
         : undefined;
@@ -1112,7 +1340,19 @@ export function wrapToolWithBeforeToolCallHook(
       }
       const startedAt = Date.now();
       try {
-        const result = await execute(toolCallId, executeParams, signal, onUpdate);
+        const rawResult = await execute(toolCallId, executeParams, signal, onUpdate);
+        // Post-failure guidance hook (Failure Recovery): enriches returned failed results for exec/python
+        // with concrete alternative suggestions (e.g. steer to execute_python). Never mutates shapes.
+        const postGuidance = getPostFailureToolGuidance({
+          toolName,
+          params: executeParams,
+          result: rawResult,
+          ctx,
+        });
+        const result = postGuidance
+          ? enrichToolResultWithGuidance(rawResult, postGuidance)
+          : rawResult;
+
         const durationMs = Date.now() - startedAt;
         await recordLoopOutcome({
           ctx,
@@ -1127,6 +1367,19 @@ export function wrapToolWithBeforeToolCallHook(
           ctx,
         });
         if (hookOptions.emitDiagnostics) {
+          if (postGuidance) {
+            emitTrustedDiagnosticEvent({
+              type: "tool.execution.guidance",
+              ...(ctx?.runId && { runId: ctx.runId }),
+              ...(ctx?.sessionKey && { sessionKey: ctx.sessionKey }),
+              ...(ctx?.sessionId && { sessionId: ctx.sessionId }),
+              toolName: normalizedToolName,
+              ...diagnosticIdentity,
+              ...(toolCallId && { toolCallId }),
+              paramsSummary: summarizeToolParams(executeParams),
+              reason: postGuidance.reason,
+            });
+          }
           if (skillMatch) {
             emitSkillUsedDiagnostic({
               ctx,

@@ -410,6 +410,13 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.outcome = "blocked";
       assignReasonCode(record, event.deniedReason);
       break;
+    case "tool.execution.guidance":
+      record.toolName = event.toolName;
+      record.source = event.toolSource;
+      record.pluginId = event.toolOwner;
+      record.outcome = "guidance";
+      if (event.reason) assignReasonCode(record, event.reason);
+      break;
     case "skill.used":
       record.toolName = event.toolName;
       record.source = event.skillSource;

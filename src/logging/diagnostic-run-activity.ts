@@ -194,7 +194,13 @@ function recordToolStarted(event: DiagnosticToolStartedActivityEvent): void {
 function recordToolEnded(
   event: Extract<
     DiagnosticEventPayload,
-    { type: "tool.execution.completed" | "tool.execution.error" | "tool.execution.blocked" }
+    {
+      type:
+        | "tool.execution.completed"
+        | "tool.execution.error"
+        | "tool.execution.blocked"
+        | "tool.execution.guidance";
+    }
   >,
 ): void {
   const activity = resolveSessionActivity(event);
@@ -363,6 +369,7 @@ function registerDiagnosticRunActivityListener(): void {
       case "tool.execution.completed":
       case "tool.execution.error":
       case "tool.execution.blocked":
+      case "tool.execution.guidance":
         recordToolEnded(event);
         return;
       case "model.call.started":

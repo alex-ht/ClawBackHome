@@ -408,6 +408,11 @@ export type DiagnosticToolExecutionBlockedEvent = DiagnosticToolExecutionBaseEve
   reason: string;
 };
 
+export type DiagnosticToolExecutionGuidanceEvent = DiagnosticToolExecutionBaseEvent & {
+  type: "tool.execution.guidance";
+  reason?: string;
+};
+
 export type DiagnosticSkillTelemetrySource = "bundled" | "unknown" | "workspace";
 export type DiagnosticSkillActivation = "command" | "read";
 
@@ -676,6 +681,7 @@ export type DiagnosticEventPayload =
   | DiagnosticToolExecutionCompletedEvent
   | DiagnosticToolExecutionErrorEvent
   | DiagnosticToolExecutionBlockedEvent
+  | DiagnosticToolExecutionGuidanceEvent
   | DiagnosticSkillUsedEvent
   | DiagnosticExecProcessCompletedEvent
   | DiagnosticRunStartedEvent
@@ -758,6 +764,7 @@ const ASYNC_DIAGNOSTIC_EVENT_TYPES = new Set<DiagnosticEventPayload["type"]>([
   "tool.execution.completed",
   "tool.execution.error",
   "tool.execution.blocked",
+  "tool.execution.guidance",
   "skill.used",
   "exec.process.completed",
   "message.delivery.started",
