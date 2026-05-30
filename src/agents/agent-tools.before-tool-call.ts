@@ -235,6 +235,8 @@ export function isBeforeToolCallBlockedError(err: unknown): err is BeforeToolCal
 // Pre-call: detect complex escaping in exec and steer to execute_python without running.
 // Post-failure + periodic: append recovery alts and (every N steps) a re-plan review nudge
 // that directs the model to get_goal + update_plan against the original task.
+// Skill Discovery (Phase 1): proactive nudges on long skill-usage gaps during stuck
+// or complex runs that have skills available in the snapshot. Reuses all prior patterns.
 
 type GuidanceContext = {
   toolName: string;
@@ -492,6 +494,74 @@ function maybeAddPeriodicReplanReview(
   const decision: GuidanceDecision = {
     text: PERIODIC_REPLAN_NUDGE,
     reason: "periodic_replan_review",
+  };
+  return enrichToolResultWithGuidance(current, decision);
+}
+
+// --- Skill Discovery Hooks (ClawBackHome Phase 1) ---
+// Purely additive, no new files/config/public API/result shape change.
+// Tracks cadence via existing runStepCounters + cheap bounded map.
+// Triggers on extended gap since last skill (read or command) when skills are
+// present in ctx.skillsSnapshot. Fires short skippable guidance via the
+// existing enrich path (so the "tool.execution.guidance" diagnostic fires).
+// Contract protected: two-step prompt-list + read discovery is high-overhead
+// for ≤4B models; without runtime nudges they stay stuck or ignore the list.
+// Text uses progressive disclosure (references existing <available_skills>).
+const SKILL_DISCOVERY_NUDGE_INTERVAL = 12; // not chatty; tuned for small-model support
+const MAX_TRACKED_SKILL_RUNS = 256;
+
+const lastSkillStepByRun = new Map<string, number>();
+
+/** Test-only reset for the skill cadence state (keeps maps bounded and tests isolated). */
+export function resetSkillDiscoveryStateForTests(): void {
+  lastSkillStepByRun.clear();
+}
+
+export function recordSkillUsageForTests(ctx?: HookContext): void {
+  recordSkillUsage(ctx);
+}
+
+function recordSkillUsage(ctx?: HookContext): void {
+  const key = getRunStepKey(ctx);
+  const current = runStepCounters.get(key) ?? 0;
+  lastSkillStepByRun.set(key, current);
+  if (lastSkillStepByRun.size > MAX_TRACKED_SKILL_RUNS) {
+    const oldest = lastSkillStepByRun.keys().next().value;
+    if (oldest) {
+      lastSkillStepByRun.delete(oldest);
+    }
+  }
+}
+
+const SKILL_DISCOVERY_GUIDANCE =
+  "Skill discovery tip (helps ≤4B models): No skills used recently on a complex task. " +
+  "Review the <available_skills> list in your system prompt and read the SKILL.md for one that matches (use the exact <location> path with the read tool). " +
+  "If unsure which fits, describe your current goal.";
+
+export function maybeAddSkillDiscoveryGuidanceForTests(
+  current: AgentToolResult<unknown>,
+  callCtx: { toolName: string; params: unknown; ctx?: HookContext },
+): AgentToolResult<unknown> {
+  return maybeAddSkillDiscoveryGuidance(current, callCtx);
+}
+
+function maybeAddSkillDiscoveryGuidance(
+  current: AgentToolResult<unknown>,
+  callCtx: { toolName: string; params: unknown; ctx?: HookContext },
+): AgentToolResult<unknown> {
+  const key = getRunStepKey(callCtx.ctx);
+  const currentStep = runStepCounters.get(key) ?? 0;
+  const last = lastSkillStepByRun.get(key) ?? 0;
+  const stepsSince = currentStep - last;
+
+  const hasSkills = !!callCtx.ctx?.skillsSnapshot?.resolvedSkills?.length;
+  if (!hasSkills || stepsSince < SKILL_DISCOVERY_NUDGE_INTERVAL) {
+    return current;
+  }
+
+  const decision: GuidanceDecision = {
+    text: SKILL_DISCOVERY_GUIDANCE,
+    reason: "skill_discovery_proactive",
   };
   return enrichToolResultWithGuidance(current, decision);
 }
@@ -1434,6 +1504,16 @@ export function wrapToolWithBeforeToolCallHook(
           ctx,
         });
 
+        // Skill Discovery (Phase 1): additive proactive nudge on long skill-usage gap when
+        // skills are available. Reuses the exact enrich + GuidanceDecision path so the
+        // guidance diagnostic fires uniformly. Trigger is gap-only in Phase 1 (loop/failure
+        // tightening can be added later without API change). Model can ignore the text.
+        result = maybeAddSkillDiscoveryGuidance(result, {
+          toolName,
+          params: executeParams,
+          ctx,
+        });
+
         // Emit guidance diagnostic for Phase 3 periodic replan nudges (and post-failure).
         // The enrich path sets details; this makes the "tool.execution.guidance" event fire
         // for periodic_replan_review as the section comment intended.
@@ -1455,6 +1535,11 @@ export function wrapToolWithBeforeToolCallHook(
           toolParams: executeParams,
           ctx,
         });
+        if (skillMatch) {
+          // Update cadence for Skill Discovery Hooks (Phase 1). Cheap; called on both
+          // read activations and command dispatches. Enables gap-based proactive nudges.
+          recordSkillUsage(ctx);
+        }
         if (hookOptions.emitDiagnostics) {
           if (guidanceReasonForEmit) {
             emitTrustedDiagnosticEvent({

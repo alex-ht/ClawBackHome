@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import { resetSkillDiscoveryStateForTests } from "../../../agents/agent-tools.before-tool-call.js";
 import { resetAdjustedParamsByToolCallIdForTests } from "../../../agents/agent-tools.before-tool-call.state.js";
 import type { AgentToolResult } from "../../../agents/runtime/index.js";
 import type {
@@ -91,4 +92,5 @@ export function resetOpenClawOwnedToolHooks(): void {
   resetGlobalHookRunner();
   resetPluginRuntimeStateForTest();
   resetAdjustedParamsByToolCallIdForTests();
+  resetSkillDiscoveryStateForTests();
 }
