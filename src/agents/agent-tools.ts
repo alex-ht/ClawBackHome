@@ -59,6 +59,7 @@ import type { AuthProfileStore } from "./auth-profiles/types.js";
 import { describeExecTool, describeProcessTool } from "./bash-tools.descriptions.js";
 import type { ExecToolDefaults } from "./bash-tools.exec-types.js";
 import type { ProcessToolDefaults } from "./bash-tools.process.js";
+import { pythonExecSchema } from "./bash-tools.schemas.js";
 import { execSchema, processSchema } from "./bash-tools.schemas.js";
 import { listChannelAgentTools } from "./channel-tools.js";
 import { shouldSuppressManagedWebSearchTool } from "./codex-native-web-search.js";
@@ -206,6 +207,30 @@ function createLazyProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool {
     displaySummary: PROCESS_TOOL_DISPLAY_SUMMARY,
     description: describeProcessTool({ hasCronTool: defaults?.hasCronTool === true }),
     parameters: processSchema,
+    execute: async (...args: Parameters<AnyAgentTool["execute"]>) =>
+      (await loadTool()).execute(...args),
+  } as AnyAgentTool;
+}
+
+function createLazyPythonExecTool(defaults?: { cwd?: string; timeoutSec?: number }): AnyAgentTool {
+  let loadedTool: AnyAgentTool | undefined;
+  const loadTool = async () => {
+    if (!loadedTool) {
+      const { createExecutePythonTool } = await loadBashToolsModule();
+      loadedTool = createExecutePythonTool(defaults) as unknown as AnyAgentTool;
+    }
+    return loadedTool;
+  };
+
+  return {
+    name: "execute_python",
+    label: "execute_python",
+    description:
+      "Execute Python code directly. Pass full source in `code` (multi-line, any chars ok — tool calls carry strings without escaping). " +
+      "Preferred for any Python logic, data work, or temp scripts that would otherwise need complex `python -c` or `bash -c` escaping in `exec`. " +
+      "When the task requires complex shell scripting or temporary logic that involves tricky string escaping (especially `bash -c`, `python -c`, complex `awk`, etc.), the model should prefer `execute_python` over the `exec` tool. " +
+      "Returns JSON: { stdout, stderr, exit_code, duration (ms) }. Always includes concrete guidance on failure.",
+    parameters: pythonExecSchema,
     execute: async (...args: Parameters<AnyAgentTool["execute"]>) =>
       (await loadTool()).execute(...args),
   } as AnyAgentTool;
@@ -826,6 +851,9 @@ export function createOpenClawCodingTools(options?: {
         scopeKey,
       })
     : null;
+  const pythonExecTool = includeShellTools
+    ? createLazyPythonExecTool({ cwd: codingRoot, timeoutSec: 60 })
+    : null;
   const applyPatchTool =
     !includeShellTools || !applyPatchEnabled || (sandboxRoot && !allowWorkspaceWrites)
       ? null
@@ -960,6 +988,7 @@ export function createOpenClawCodingTools(options?: {
     ...(includeShellTools && applyPatchTool ? [applyPatchTool as unknown as AnyAgentTool] : []),
     ...(execTool ? [execTool as unknown as AnyAgentTool] : []),
     ...(processTool ? [processTool as unknown as AnyAgentTool] : []),
+    ...(pythonExecTool ? [pythonExecTool as unknown as AnyAgentTool] : []),
     // Channel docking: include channel-defined agent tools (login, etc.).
     ...(includeChannelTools ? listChannelAgentTools({ cfg: options?.config }) : []),
     ...(includeOpenClawTools

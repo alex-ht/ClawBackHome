@@ -22,6 +22,7 @@ export function describeExecTool(params?: { agentId?: string; hasCronTool?: bool
       ? "Do not use exec sleep or delay loops for reminders or deferred follow-ups; use cron instead."
       : undefined,
     "Use pty=true for TTY-required commands (terminal UIs, coding agents).",
+    "For Python code (especially multi-line or with quotes), prefer the dedicated `execute_python` tool instead of `python -c` inside exec — it avoids all shell escaping and returns structured {stdout,stderr,exit_code,duration}.",
   ]
     .filter(Boolean)
     .join(" ");

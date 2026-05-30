@@ -8,6 +8,8 @@ title: "Exec tool"
 
 Run shell commands in the workspace. `exec` is a mutating shell surface: commands can create, edit, or delete files wherever the selected host or sandbox filesystem permits. Disabling OpenClaw filesystem tools such as `write`, `edit`, or `apply_patch` does not make `exec` read-only.
 
+For Python work (especially multi-line code or strings with quotes), prefer the dedicated [`execute_python`](/tools/execute-python) tool. It removes all shell-escaping burden and returns structured `{stdout, stderr, exit_code, duration}`. The `exec` description and error paths also surface this guidance.
+
 Supports foreground + background execution via `process`. If `process` is disallowed, `exec` runs synchronously and ignores `yieldMs`/`background`.
 Background sessions are scoped per agent; `process` only sees sessions from the same agent.
 
@@ -282,4 +284,5 @@ Notes:
 - [Exec Approvals](/tools/exec-approvals) — approval gates for shell commands
 - [Sandboxing](/gateway/sandboxing) — running commands in sandboxed environments
 - [Background Process](/gateway/background-process) — long-running exec and process tool
+- [Python execution](/tools/execute-python) — preferred for Python code (avoids escaping)
 - [Security](/gateway/security) — tool policy and elevated access

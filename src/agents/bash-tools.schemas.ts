@@ -74,3 +74,28 @@ export const processSchema = Type.Object({
     }),
   ),
 });
+
+export const pythonExecSchema = Type.Object({
+  code: Type.String({
+    description:
+      "Python source code to execute. Multi-line code, imports, functions, and complex strings are supported directly (no shell escaping required in the tool call).",
+  }),
+  cwd: Type.Optional(
+    Type.String({
+      description:
+        "Working directory for the Python process (defaults to agent workspace or current dir)",
+    }),
+  ),
+  timeout: Type.Optional(
+    Type.Number({
+      description: "Timeout in seconds before killing the process (default 60)",
+      minimum: 0,
+    }),
+  ),
+  env: Type.Optional(
+    Type.Record(Type.String(), Type.String(), {
+      description:
+        "Environment variables to set for the Python process (merged over inherited env)",
+    }),
+  ),
+});

@@ -1284,6 +1284,7 @@
                   "tools/exec-approvals",
                   "tools/exec-approvals-advanced",
                   "tools/exec",
+                  "tools/execute-python",
                   "tools/image-generation",
                   "tools/llm-task",
                   "tools/lobster",
